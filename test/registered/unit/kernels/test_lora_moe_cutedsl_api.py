@@ -1,5 +1,6 @@
 """CPU contracts for grouped-GEMM kernel selection and FP8 prepare arguments."""
 
+import ast
 import importlib.util
 import sys
 import types
@@ -184,6 +185,93 @@ class TestFp8Prepares(CustomTestCase):
                 for view, scale in zip(result.operand_args[2:4], scales):
                     self.assertIs(view.tensor, scale)
                     self.assertEqual(view.leading_dim, axis)
+
+
+class TestBlockScaledQuantArgs(CustomTestCase):
+    def test_quantized_launch_arguments_match_kernel_signatures(self):
+        from sglang.kernels.ops.lora.moe.quant_blockscaled import (
+            BlockScaledRows,
+            act_quant_args,
+        )
+
+        codes = torch.empty((128, 64), dtype=torch.uint8)
+        storage = dict(
+            data=codes,
+            scales=torch.empty(1024, dtype=torch.uint8),
+            sf_vec_size=16,
+            rows_per_slab=128,
+        )
+        rows = BlockScaledRows(
+            **storage,
+            row_scales=torch.ones(128),
+            row_denominator=1536.0,
+            use_4over6=True,
+            err_mode="MSE",
+        )
+        static_rows = BlockScaledRows(**storage, global_scale=0.25)
+        quant_args = rows.kernel_args()
+        consumers = (
+            ("quant_blockscaled", "_quant_rows_kernel", (quant_args,)),
+            (
+                "dispatch_contiguous",
+                "_fill_rows_contiguous_blockscaled_kernel",
+                (quant_args,),
+            ),
+            (
+                "dispatch_masked",
+                "_dispatch_fill_masked_blockscaled_kernel",
+                (quant_args,),
+            ),
+            (
+                "activation_delta",
+                "_act_delta_kernel",
+                tuple(
+                    act_quant_args(target, fallback=codes) for target in (rows, None)
+                ),
+            ),
+            (
+                "fused_act",
+                "_b_act_kernel",
+                tuple(act_quant_args(target) for target in (static_rows, None)),
+            ),
+        )
+        sources = _API.parents[1]
+        launch_options = {"num_warps", "num_stages", "num_ctas", "maxnreg"}
+        for module, kernel, variants in consumers:
+            tree = ast.parse((sources / f"{module}.py").read_text())
+            signature = next(
+                node.args
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == kernel
+            )
+            positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
+            allowed = set(positional) | {arg.arg for arg in signature.kwonlyargs}
+            required = set(positional[: len(positional) - len(signature.defaults)])
+            required.update(
+                arg.arg
+                for arg, default in zip(signature.kwonlyargs, signature.kw_defaults)
+                if default is None
+            )
+            (launch,) = (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Subscript)
+                and getattr(node.func.value, "id", None) == kernel
+            )
+            self.assertEqual(sum(arg.arg is None for arg in launch.keywords), 1, kernel)
+            explicit = positional[: len(launch.args)] + [
+                arg.arg
+                for arg in launch.keywords
+                if arg.arg and arg.arg not in launch_options
+            ]
+            for quant in variants:
+                with self.subTest(kernel=kernel, keys=set(quant)):
+                    supplied = explicit + list(quant)
+                    # Optional parameters may be absent; each supplied key occurs once.
+                    self.assertCountEqual(
+                        supplied, required | (allowed & set(supplied))
+                    )
 
 
 if __name__ == "__main__":
