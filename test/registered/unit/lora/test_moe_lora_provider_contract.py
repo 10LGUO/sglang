@@ -1,5 +1,3 @@
-"""Real provider methods test admission, geometry, and finalization with GPU boundaries mocked."""
-
 from __future__ import annotations
 
 import sys
@@ -44,13 +42,13 @@ class TestNvFp4PreparedQuantInfo(CustomTestCase):
 
 class TestProviderGeometry(CustomTestCase):
     def test_triton_fp8_k_tiles_stay_within_scale_groups(self):
-        from sglang.srt.lora.moe.base_gemm_provider.triton_bf16 import (
-            TritonBf16ContiguousProvider,
+        from sglang.srt.lora.moe.base_gemm_provider.triton import (
+            TritonBf16PairProvider,
         )
 
         # The FP8 provider shares the method; the stand-in below carries its
         # block shape and dtype tag.
-        config_for = TritonBf16ContiguousProvider._config_for
+        config_for = TritonBf16PairProvider._config_for
         module = types.ModuleType(
             "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"
         )
@@ -69,6 +67,7 @@ class TestProviderGeometry(CustomTestCase):
             ),
             _config_dtype_tag="fp8_w8a8",
             _config_block_shape=[128, 128],
+            _config_per_channel_quant=False,
             _configs={},
         )
         with mock.patch.dict(sys.modules, {module.__name__: module}):
@@ -197,16 +196,25 @@ class TestRunnerAdmission(CustomTestCase):
     def test_binding_surfaces_plan_validation(self):
         """A provider exposing one gate/up slice cannot serve a gated layer."""
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
+        from sglang.srt.lora.moe import runner as runner_module
         from sglang.srt.lora.moe.runner import MoeLoraRunner
         from sglang.srt.runtime_context import get_context, get_flags
 
-        provider = SimpleNamespace(
-            hidden_size=2048,
-            intermediate_size=768,
-            num_local_experts=256,
-            gate_up_slices=1,
-            contract=SimpleNamespace(lora_delta_dtype=torch.bfloat16),
-        )
+        class QuantInfo:
+            @staticmethod
+            def from_layer(base_layer):
+                return None
+
+        class Provider:
+            contract = SimpleNamespace(quant_info_cls=QuantInfo)
+            hidden_size = 2048
+            intermediate_size = 768
+            num_local_experts = 256
+            gate_up_slices = 1
+
+            def __init__(self, quant_info):
+                self.quant_info = quant_info
+
         layer = SimpleNamespace(
             w2_weight=SimpleNamespace(
                 device=torch.device("cuda"), shape=(256, 2048, 768)
@@ -220,21 +228,25 @@ class TestRunnerAdmission(CustomTestCase):
         # from_layer reads the published MoE runner backend for its vendor.
         with (
             mock.patch.object(MoeLoraRunner, "_admit", return_value="bf16"),
-            mock.patch.object(MoeLoraRunner, "_build_provider", return_value=provider),
+            mock.patch.object(
+                runner_module, "select_provider_cls", return_value=Provider
+            ),
             get_context().override_server_args(),
             get_flags().moe.override(runner_backend=MoeRunnerBackend.LORA_CUTEDSL),
-            self.assertRaisesRegex(ValueError, "gate/up slices"),
         ):
-            MoeLoraRunner.from_layer(
+            with self.assertRaisesRegex(ValueError, "gate/up slices"):
+                MoeLoraRunner.from_layer(
+                    layer, workspace=object(), is_shared_outer=False, physical_rank=64
+                )
+            Provider.gate_up_slices = 2
+            runner = MoeLoraRunner.from_layer(
                 layer, workspace=object(), is_shared_outer=False, physical_rank=64
             )
+        self.assertIs(runner.providers["expert_major"], runner.providers["route_major"])
 
 
 class TestLayerRunnerBackendResolution(CustomTestCase):
-    """The selected lora runner backend binds the new MoE runner and rebinds
-    run_moe_core."""
-
-    def test_v2_accepts_each_new_moe_runner(self):
+    def test_v2_binds_the_selected_moe_runner(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
         from sglang.srt.lora.layers import FusedMoEWithLoRA
